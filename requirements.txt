@@ -1,0 +1,7 @@
+boto3
+browser-use
+langchain-google-genai
+playwright
+requests
+asyncio-timeout
+python-dotenv
