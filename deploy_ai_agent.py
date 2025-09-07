@@ -432,9 +432,70 @@ def create_iam_role():
         sys.exit(1)
 
 
-def launch_ec2_instance(prompt):
+def upload_files_to_s3(prompt):
+    """Upload task prompt, automation script, and scrapers to S3"""
+    s3 = boto3.client('s3', region_name=REGION)
+    account_id = boto3.client('sts').get_caller_identity()['Account']
+    bucket_name = f"ai-executor-results-{account_id}"
+    task_key = f"{INSTANCE_NAME}-task.txt"
+    script_key = f"{INSTANCE_NAME}-automation_task.py"
+    scrapers_key = f"{INSTANCE_NAME}-scrapers.zip"
+    
+    try:
+        # Upload task prompt to S3
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=task_key,
+            Body=prompt.encode('utf-8'),
+            ContentType='text/plain'
+        )
+        print(f"✅ Task prompt uploaded to S3: s3://{bucket_name}/{task_key}")
+        
+        # Upload automation script to S3
+        with open('scripts/automation_task.py', 'r') as f:
+            automation_script = f.read()
+        
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=script_key,
+            Body=automation_script.encode('utf-8'),
+            ContentType='text/plain'
+        )
+        print(f"✅ Automation script uploaded to S3: s3://{bucket_name}/{script_key}")
+        
+        # Create and upload scrapers zip
+        import zipfile
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_zip:
+            with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add all files from scripts/scrapers directory
+                scrapers_dir = 'scripts/scrapers'
+                for root, dirs, files in os.walk(scrapers_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        # Store with relative path starting from scrapers/
+                        arcname = os.path.relpath(file_path, 'scripts')
+                        zipf.write(file_path, arcname)
+            
+            # Upload zip to S3
+            s3.upload_file(temp_zip.name, bucket_name, scrapers_key)
+            print(f"✅ Scrapers uploaded to S3: s3://{bucket_name}/{scrapers_key}")
+            
+            # Clean up temp file
+            os.unlink(temp_zip.name)
+        
+        return task_key, script_key, scrapers_key
+    except Exception as e:
+        print(f"❌ Failed to upload files to S3: {e}")
+        sys.exit(1)
+
+def launch_ec2_instance(prompt, scraper=None):
     """Launch EC2 instance with user data script"""
     print(f"🔄 Launching EC2 instance '{INSTANCE_NAME}'...")
+    
+    # Upload task prompt, automation script, and scrapers to S3 first
+    task_key, script_key, scrapers_key = upload_files_to_s3(prompt)
     
     ec2 = boto3.client('ec2', region_name=REGION)
     
@@ -468,21 +529,31 @@ def launch_ec2_instance(prompt):
     
     # Launch instance
     try:
-        # Read the user data script and automation script
+        # Read the user data script
         with open('scripts/user_data.sh', 'r') as f:
             user_data = f.read()
         
-        with open('scripts/automation_task.py', 'r') as f:
-            automation_script = f.read()
-        
-        # Replace the placeholder with the actual automation script
-        script_replacement = f'''# Create automation script on EC2 instance
-curl -X POST http://requestbin.whapi.cloud/1phw2m41 -d "status=creating_automation_script" 2>/dev/null || true
-cat > /tmp/automation_task.py << 'SCRIPT_EOF'
-{automation_script}
-SCRIPT_EOF
-curl -X POST http://requestbin.whapi.cloud/1phw2m41 -d "status=automation_script_created" 2>/dev/null || true
-log "✅ Automation script created"'''
+        # Replace the placeholder with auto-shutdown and S3 download of automation script
+        script_replacement = f'''# Schedule automatic shutdown after 3 days (259200 seconds) as safety backup
+echo "⏰ Scheduling automatic shutdown in 3 days as safety backup..."
+(sleep 259200; echo "🛑 Auto-shutdown timeout reached - terminating instance"; shutdown -h now) &
+AUTO_SHUTDOWN_PID=$!
+echo "✅ Auto-shutdown scheduled (PID: $AUTO_SHUTDOWN_PID)"
+
+# Download automation script from S3
+echo "📥 Downloading automation script from S3..."
+aws s3 cp s3://$RESULTS_BUCKET/{script_key} /tmp/automation_task.py --region $REGION
+if [ $? -eq 0 ]; then
+    echo "✅ Automation script downloaded from S3"
+    curl -X POST http://requestbin.whapi.cloud/1phw2m41 -d "status=automation_script_downloaded" 2>/dev/null || true
+else
+    echo "❌ Failed to download automation script from S3"
+    curl -X POST http://requestbin.whapi.cloud/1phw2m41 -d "status=automation_script_download_failed" 2>/dev/null || true
+    echo "⏳ Waiting 30 seconds for final log upload..."
+    sleep 30
+    shutdown -h now
+    exit 1
+fi'''
         
         user_data = user_data.replace('# AUTOMATION_SCRIPT_PLACEHOLDER', script_replacement)
         
@@ -498,6 +569,12 @@ log "✅ Automation script created"'''
             UserData=user_data,
             IamInstanceProfile={'Name': 'ai-executor-ec2-role'},
             InstanceInitiatedShutdownBehavior='terminate',
+            MetadataOptions={
+                'HttpEndpoint': 'enabled',
+                'HttpTokens': 'optional',
+                'HttpPutResponseHopLimit': 1,
+                'InstanceMetadataTags': 'enabled'
+            },
             TagSpecifications=[{
                 'ResourceType': 'instance',
                 'Tags': [
@@ -505,9 +582,13 @@ log "✅ Automation script created"'''
                     {'Key': 'Purpose', 'Value': 'AI-Executor'},
                     {'Key': 'AutoTerminate', 'Value': 'true'},
                     {'Key': 'GOOGLE_API_KEY', 'Value': os.environ.get("GOOGLE_API_KEY", "")},
-                    {'Key': 'TASK_PROMPT', 'Value': prompt},
+                    {'Key': 'TASK_ID', 'Value': task_id},
+                    {'Key': 'TASK_KEY', 'Value': task_key},
+                    {'Key': 'SCRIPT_KEY', 'Value': script_key},
+                    {'Key': 'SCRAPERS_KEY', 'Value': scrapers_key},
                     {'Key': 'INSTANCE_NAME', 'Value': INSTANCE_NAME},
-                    {'Key': 'IMAGE_TAG', 'Value': IMAGE_TAG}
+                    {'Key': 'IMAGE_TAG', 'Value': IMAGE_TAG},
+                    {'Key': 'SCRAPER', 'Value': scraper or ''},
                 ]
             }]
         )
@@ -520,7 +601,7 @@ log "✅ Automation script created"'''
         print(f"❌ EC2 launch failed: {e}")
         sys.exit(1)
 
-def monitor_instance_and_get_results(instance_id):
+def monitor_instance_and_get_results(instance_id, task_id):
     """Monitor ACTUAL EC2 instance status and console output"""
     print(f"⏳ Monitoring EC2 instance {instance_id} directly...")
     
@@ -529,10 +610,10 @@ def monitor_instance_and_get_results(instance_id):
     
     account_id = boto3.client('sts').get_caller_identity()['Account']
     results_bucket = f"ai-executor-results-{account_id}"
-    result_key = f"{INSTANCE_NAME}-result.json"
+    result_key = f"{task_id}-result.json"
     
     start_time = time.time()
-    timeout = 1800  # 30 minutes timeout
+    timeout = 259200  # 3 days timeout (same as auto-shutdown)
     last_console_length = 0
     
     print("📋 EC2 Instance Status:")
@@ -577,6 +658,31 @@ def monitor_instance_and_get_results(instance_id):
                                 for line in lines:
                                     if line.strip():
                                         print(f"📋 {line}")
+                                        
+                                        # Detect browser-use hotlink URL
+                                        if "https://cloud.browser-use.com/hotlink?user_code=" in line:
+                                            import re
+                                            url_match = re.search(r'https://cloud\.browser-use\.com/hotlink\?user_code=[A-Z0-9]+', line)
+                                            if url_match:
+                                                hotlink_url = url_match.group()
+                                                print(f"🔗 Detected browser hotlink: {hotlink_url}")
+                                                
+                                                # Save hotlink to task JSON
+                                                try:
+                                                    task_file = f"results/{task_id}.json"
+                                                    if os.path.exists(task_file):
+                                                        with open(task_file, 'r') as f:
+                                                            task_data = json.load(f)
+                                                        
+                                                        task_data["browser_hotlink"] = hotlink_url
+                                                        
+                                                        with open(task_file, 'w') as f:
+                                                            json.dump(task_data, f, indent=2)
+                                                        
+                                                        print(f"💾 Browser hotlink saved to task file")
+                                                except Exception as save_error:
+                                                    print(f"⚠️  Could not save hotlink: {save_error}")
+                                        
                             last_console_length = len(current_log)
                             
                     except s3.exceptions.NoSuchKey:
@@ -603,8 +709,16 @@ def monitor_instance_and_get_results(instance_id):
                     print(f"   Task: {result.get('task', 'unknown')}")
                     if result.get('result'):
                         print(f"   Result: {result['result']}")
+                    if result.get('final_url'):
+                        print(f"   Final URL: {result['final_url']}")
                     if result.get('error'):
                         print(f"   Error: {result['error']}")
+                    
+                    # Save full result to local file
+                    result_filename = f"result-{INSTANCE_NAME}.json"
+                    with open(result_filename, 'w') as f:
+                        json.dump(result, f, indent=2)
+                    print(f"💾 Full result saved to: {result_filename}")
                     
                     return result
                     
@@ -629,14 +743,47 @@ def monitor_instance_and_get_results(instance_id):
                 except:
                     pass
                 
-                # Check for final results
-                try:
-                    s3.head_object(Bucket=results_bucket, Key=result_key)
-                    response = s3.get_object(Bucket=results_bucket, Key=result_key)
-                    result = json.loads(response['Body'].read().decode())
-                    return result
-                except:
-                    return {"status": "error", "error": "Instance terminated without results"}
+                # ALWAYS try to get results - wait a bit for upload to complete
+                print("📥 Checking for final results in S3...")
+                for attempt in range(6):  # Try for up to 30 seconds (5s * 6)
+                    try:
+                        s3.head_object(Bucket=results_bucket, Key=result_key)
+                        response = s3.get_object(Bucket=results_bucket, Key=result_key)
+                        result = json.loads(response['Body'].read().decode())
+                        
+                        # Load existing task JSON and add results section
+                        os.makedirs("results", exist_ok=True)
+                        result_filename = f"results/{task_id}.json"
+                        
+                        # Load existing task data
+                        task_data = {}
+                        if os.path.exists(result_filename):
+                            with open(result_filename, 'r') as f:
+                                task_data = json.load(f)
+                        
+                        # Add the automation results
+                        task_data["automation_result"] = result
+                        
+                        # Save updated task data
+                        with open(result_filename, 'w') as f:
+                            json.dump(task_data, f, indent=2)
+                        
+                        print("✅ Found result in S3!")
+                        print(f"💾 Result saved to: {result_filename}")
+                        print(f"📋 Full result:")
+                        print(json.dumps(result, indent=2))
+                        
+                        return result
+                    except s3.exceptions.NoSuchKey:
+                        if attempt < 5:  # Not the last attempt
+                            print(f"   Attempt {attempt + 1}/6 - waiting for result upload...")
+                            time.sleep(5)
+                        else:
+                            print("❌ No result found in S3 after 30 seconds")
+                            return {"status": "error", "error": "Instance terminated without uploading results"}
+                    except Exception as e:
+                        print(f"❌ Error checking S3 results: {e}")
+                        return {"status": "error", "error": f"S3 error: {str(e)}"}
             
             print("-" * 40)
             time.sleep(30)  # Check every 30 seconds
@@ -646,29 +793,42 @@ def monitor_instance_and_get_results(instance_id):
             time.sleep(10)
     
     print("\n⏰ Timeout reached - task may still be running")
-    return {"status": "timeout", "error": "Task timed out after 30 minutes"}
+    return {"status": "timeout", "error": "Task timed out after 3 days"}
+
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python deploy_ec2.py 'your prompt here'")
-        print("Example: python deploy_ec2.py 'Navigate to Amazon and find the current price of iPhone 15'")
-        sys.exit(1)
+    import argparse
     
-    prompt = sys.argv[1]
+    parser = argparse.ArgumentParser(description='Deploy EC2 instance for browser automation')
+    parser.add_argument('--task', required=True, help='The automation task to perform')
+    parser.add_argument('--scraper', help='Run scraper after automation task (optional)')
+    parser.add_argument('--task-id', required=True, help='UUID for task tracking')
+    
+    args = parser.parse_args()
+    
+    # Append Cloudflare verification instructions to the task prompt
+    cloudflare_instructions = "\n\nIn case you see a verification checkbox, always wait 10 seconds for the verification checkbox to appear. Once it appears, click it once, and wait 5 more seconds."
+    prompt = args.task + cloudflare_instructions
+    scraper = args.scraper
+    task_id = args.task_id
+    
+    print(f"🎯 Task ID: {task_id}")
     print(f"🎯 Task: {prompt}")
     print(f"🏷️  Instance: {INSTANCE_NAME}")
+    if scraper:
+        print(f"🔧 Scraper: {scraper}")
     
     check_aws_credentials()
     build_docker_image_if_needed()
     role_name = create_iam_role()
-    instance_id = launch_ec2_instance(prompt)
+    instance_id = launch_ec2_instance(prompt, scraper)
     
     print("\n🚀 EC2 deployment completed!")
     print(f"📋 Instance ID: {instance_id}")
     print("⏳ Instance will auto-terminate when task completes")
     print("📊 Monitoring for results...")
     
-    result = monitor_instance_and_get_results(instance_id)
+    result = monitor_instance_and_get_results(instance_id, task_id)
     
     print("\n🎉 Task completed!")
 
